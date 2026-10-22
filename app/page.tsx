@@ -3,11 +3,23 @@
 import { useRef, useEffect, useState } from "react";
 import { FilesetResolver, PoseLandmarker, DrawingUtils } from "@mediapipe/tasks-vision";
 
+// MediaPipe pose landmark indices (the 33-point model).
+const LEFT_HIP = 23;
+const RIGHT_HIP = 24;
+
 export default function Home() {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Fast world: the live hip height, updated every frame. Game logic reads this ref
+  // directly (no React re-render). null when no pose is detected.
+  const hipHeightRef = useRef<number | null>(null);
+
+  // Slow world: a throttled copy of hip height, only for the dev debug overlay.
+  const [debugHip, setDebugHip] = useState<number | null>(null);
+  const [showDebug, setShowDebug] = useState(true);
 
   // --- Pose detection: load the model once, then draw the skeleton every frame ---
   useEffect(() => {
@@ -42,6 +54,7 @@ export default function Home() {
       const drawingUtils = new DrawingUtils(ctx);
 
       let lastVideoTime = -1;
+      let lastHudUpdate = 0;
 
       function renderLoop() {
         // Only run detection when the video has advanced to a NEW frame.
@@ -65,6 +78,25 @@ export default function Home() {
             drawingUtils.drawLandmarks(landmarks, { radius: 4 });
             drawingUtils.drawConnectors(landmarks, PoseLandmarker.POSE_CONNECTIONS);
           }
+
+          // --- Hip height signal ---
+          if (result.landmarks.length > 0) {
+            const pose = result.landmarks[0];
+            // y is 0 (top of frame) to 1 (bottom), so a LARGER value = hips lower.
+            const hipY = (pose[LEFT_HIP].y + pose[RIGHT_HIP].y) / 2;
+
+            // Fast world: always update the ref (this is what game logic will read).
+            hipHeightRef.current = hipY;
+
+            // Slow world: push into React state only ~10x/sec for the debug overlay.
+            const now = performance.now();
+            if (now - lastHudUpdate > 100) {
+              lastHudUpdate = now;
+              setDebugHip(hipY);
+            }
+          } else {
+            hipHeightRef.current = null;
+          }
         }
 
         animationId = requestAnimationFrame(renderLoop); // schedule next frame
@@ -83,6 +115,15 @@ export default function Home() {
       cancelAnimationFrame(animationId);
       poseLandmarker?.close();
     };
+  }, []);
+
+  // --- Dev debug overlay toggle: press "D" to show/hide ---
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "d" || e.key === "D") setShowDebug((v) => !v);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   // --- Camera: request the webcam and stream it into the <video> ---
@@ -140,6 +181,25 @@ export default function Home() {
           transform: "scaleX(-1)", // mirror the canvas the SAME way as the video
         }}
       />
+      {showDebug && (
+        <div
+          style={{
+            position: "absolute",
+            top: 8,
+            left: 8,
+            padding: "6px 10px",
+            background: "rgba(0, 0, 0, 0.6)",
+            color: "#0f0",
+            font: "13px monospace",
+            borderRadius: "6px",
+            pointerEvents: "none", // never intercept clicks
+          }}
+        >
+          hipY: {debugHip === null ? "— (no pose)" : debugHip.toFixed(3)}
+          <br />
+          <span style={{ color: "#888" }}>press D to hide</span>
+        </div>
+      )}
       {error && <p style={{ color: "crimson" }}>{error}</p>}
     </div>
   );
