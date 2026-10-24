@@ -20,8 +20,9 @@ export interface InputState {
 export interface Obstacle {
   id: number;
   lane: Lane;
-  y: number; // scrolls toward the runner (added in feature 4.5)
+  y: number; // scrolls toward the runner
   kind: ObstacleKind;
+  resolved: boolean; // true once it has passed the runner line and been scored/crashed
 }
 
 export interface Runner {
@@ -35,6 +36,8 @@ export interface GameState {
   status: GameStatus;
   runner: Runner;
   obstacles: Obstacle[];
+  spawnTimer: number; // counts down; spawns an obstacle and resets when it hits 0
+  nextObstacleId: number; // monotonic id for new obstacles
   speed: number; // derived from input.tempo
   score: number;
   combo: number;
@@ -48,10 +51,27 @@ export const LANE_SWITCH_SPEED = 0.15; // fraction of the lane gap closed per fr
 export const BASE_SPEED = 3; // scroll speed at tempo 0
 export const SPEED_RANGE = 5; // additional scroll speed at tempo 1
 
+// Obstacles live in an abstract "field" that the renderer maps to pixels.
+export const FIELD_HEIGHT = 600; // top (0) to bottom (FIELD_HEIGHT) of the playfield
+export const RUNNER_Y = 500; // the runner's row / collision line, in field units
+export const OBSTACLE_HEIGHT = 40; // obstacle thickness, in field units
+export const SPAWN_EVERY = 70; // frames between spawns (at dt = 1)
+
 const DEFAULT_BPM = 90;
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
+}
+
+/** True if the runner fails the move this obstacle requires. */
+function isCrash(o: Obstacle, runnerX: number, posture: Posture): boolean {
+  if (o.kind === "lowbar") {
+    // Spans the whole field: the only way through is to crouch.
+    return posture !== "crouch";
+  }
+  // wall: occupies one lane. Crash if the runner still overlaps that lane
+  // (more than halfway across to the other lane = safe).
+  return Math.abs(runnerX - o.lane) < 0.5;
 }
 
 /** A fresh game at the start of a run. */
@@ -60,6 +80,8 @@ export function createInitialState(): GameState {
     status: "playing",
     runner: { lane: 0, x: 0, posture: "run", jumpT: 0 },
     obstacles: [],
+    spawnTimer: SPAWN_EVERY,
+    nextObstacleId: 1,
     speed: BASE_SPEED,
     score: 0,
     combo: 0,
@@ -73,7 +95,12 @@ export function createInitialState(): GameState {
  * `dt` is a frame-rate scalar (~1.0 at 60fps, from Pixi's ticker.deltaTime), so the game
  * runs at the same speed regardless of actual frame rate.
  */
-export function update(state: GameState, input: InputState, dt: number): GameState {
+export function update(
+  state: GameState,
+  input: InputState,
+  dt: number,
+  rng: () => number = Math.random, // injectable so tests can make spawns deterministic
+): GameState {
   // Nothing moves unless we're playing (e.g. after game over).
   if (state.status !== "playing") return state;
 
@@ -90,9 +117,46 @@ export function update(state: GameState, input: InputState, dt: number): GameSta
 
   const speed = BASE_SPEED + clamp(input.tempo, 0, 1) * SPEED_RANGE;
 
+  // Scroll existing obstacles downward; drop any that have fully passed the bottom.
+  const obstacles = state.obstacles
+    .map((o) => ({ ...o, y: o.y + speed * dt }))
+    .filter((o) => o.y < FIELD_HEIGHT + OBSTACLE_HEIGHT);
+
+  // Spawn a new obstacle when the timer elapses.
+  let spawnTimer = state.spawnTimer - dt;
+  let nextObstacleId = state.nextObstacleId;
+  if (spawnTimer <= 0) {
+    spawnTimer += SPAWN_EVERY;
+    const lane: Lane = rng() < 0.5 ? 0 : 1;
+    const kind: ObstacleKind = rng() < 0.5 ? "wall" : "lowbar";
+    obstacles.push({ id: nextObstacleId, lane, y: -OBSTACLE_HEIGHT, kind, resolved: false });
+    nextObstacleId += 1;
+  }
+
+  // Resolve obstacles that have reached the runner line: crash, or score and move on.
+  let status: GameStatus = state.status;
+  let score = state.score;
+  let combo = state.combo;
+  for (const o of obstacles) {
+    if (o.resolved || o.y + OBSTACLE_HEIGHT < RUNNER_Y) continue; // not yet at the runner
+    o.resolved = true;
+    if (isCrash(o, x, posture)) {
+      status = "over";
+    } else {
+      combo += 1;
+      score += 1;
+    }
+  }
+
   return {
     ...state,
+    status,
     runner: { ...state.runner, lane: targetLane, x, posture },
     speed,
+    obstacles,
+    spawnTimer,
+    nextObstacleId,
+    score,
+    combo,
   };
 }
