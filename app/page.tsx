@@ -1,121 +1,126 @@
 'use client'
 
-import { useRef, useEffect, useState } from "react";
-import { FilesetResolver, PoseLandmarker, DrawingUtils } from "@mediapipe/tasks-vision";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { createDribbleTracker, type DribbleTracker } from "@/game/input/dribbleTracker";
+import {
+  type Calibration,
+  type StanceLevel,
+  makeCalibration,
+  classifyStance,
+  saveCalibration,
+  loadCalibration,
+} from "@/game/input/calibration";
 
-// MediaPipe pose landmark indices (the 33-point model).
-const LEFT_HIP = 23;
-const RIGHT_HIP = 24;
+const calBtnStyle: CSSProperties = {
+  padding: "16px 28px",
+  fontSize: 18,
+  fontWeight: 600,
+  borderRadius: 10,
+  border: "none",
+  background: "#ff4655",
+  color: "#fff",
+  cursor: "pointer",
+};
+
+// Colors + labels per stance zone for the live indicator.
+const STANCE_UI: Record<StanceLevel, { label: string; bg: string }> = {
+  tall: { label: "TOO TALL — get low", bg: "#dc2626" },
+  ready: { label: "READY", bg: "#16a34a" },
+  duck: { label: "DUCK", bg: "#2563eb" },
+};
 
 export default function Home() {
-
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Fast world: the live hip height, updated every frame. Game logic reads this ref
-  // directly (no React re-render). null when no pose is detected.
-  const hipHeightRef = useRef<number | null>(null);
-
-  // Slow world: a throttled copy of hip height, only for the dev debug overlay.
+  // Debug overlay (dev only): shows the live hip-height signal.
   const [debugHip, setDebugHip] = useState<number | null>(null);
   const [showDebug, setShowDebug] = useState(true);
 
-  // --- Pose detection: load the model once, then draw the skeleton every frame ---
+  // Calibration state.
+  const trackerRef = useRef<DribbleTracker | null>(null);
+  const [cal, setCal] = useState<Calibration | null>(null);
+  const [capturing, setCapturing] = useState(false);
+
+  // --- Pose tracking via the shared DribbleTracker ---
   useEffect(() => {
-    let poseLandmarker: PoseLandmarker | null = null;
-    let animationId = 0;
-    let cancelled = false; // guard: setup is async and may finish after unmount
+    let tracker: DribbleTracker | null = null;
+    let cancelled = false;
+    let pollId = 0;
 
-    async function setup() {
-      const vision = await FilesetResolver.forVisionTasks(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/wasm"
-      );
-
-      poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath:
-            "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-          delegate: "GPU",
-        },
-        runningMode: "VIDEO",
-        numPoses: 1,
-      });
-
-      // If the component unmounted while the model was downloading, bail out cleanly.
-      if (cancelled) {
-        poseLandmarker.close();
-        return;
-      }
-
-      const video = videoRef.current!;
-      const canvas = canvasRef.current!;
-      const ctx = canvas.getContext("2d")!;
-      const drawingUtils = new DrawingUtils(ctx);
-
-      let lastVideoTime = -1;
-      let lastHudUpdate = 0;
-
-      function renderLoop() {
-        // Only run detection when the video has advanced to a NEW frame.
-        if (video.videoWidth > 0 && video.currentTime !== lastVideoTime) {
-          lastVideoTime = video.currentTime;
-
-          // Size the drawing buffer to the real video resolution (once).
-          // Without this the canvas stays 300x150 and the skeleton misaligns.
-          if (canvas.width !== video.videoWidth) {
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-          }
-
-          // Ask: where is the body in this frame? (synchronous in VIDEO mode)
-          const result = poseLandmarker!.detectForVideo(video, performance.now());
-
-          // Clear last frame's skeleton first, or trails smear.
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-          for (const landmarks of result.landmarks) {
-            drawingUtils.drawLandmarks(landmarks, { radius: 4 });
-            drawingUtils.drawConnectors(landmarks, PoseLandmarker.POSE_CONNECTIONS);
-          }
-
-          // --- Hip height signal ---
-          if (result.landmarks.length > 0) {
-            const pose = result.landmarks[0];
-            // y is 0 (top of frame) to 1 (bottom), so a LARGER value = hips lower.
-            const hipY = (pose[LEFT_HIP].y + pose[RIGHT_HIP].y) / 2;
-
-            // Fast world: always update the ref (this is what game logic will read).
-            hipHeightRef.current = hipY;
-
-            // Slow world: push into React state only ~10x/sec for the debug overlay.
-            const now = performance.now();
-            if (now - lastHudUpdate > 100) {
-              lastHudUpdate = now;
-              setDebugHip(hipY);
-            }
-          } else {
-            hipHeightRef.current = null;
-          }
+    async function start() {
+      try {
+        tracker = await createDribbleTracker({
+          video: videoRef.current!,
+          canvas: canvasRef.current,
+        });
+        if (cancelled) {
+          tracker.destroy();
+          tracker = null;
+          return;
         }
-
-        animationId = requestAnimationFrame(renderLoop); // schedule next frame
+        trackerRef.current = tracker;
+        pollId = window.setInterval(() => {
+          setDebugHip(tracker!.getSignals().hipHeight);
+        }, 100);
+      } catch (err) {
+        console.error("Pose setup failed", err);
+        setError("Could not start pose detection.");
       }
-
-      renderLoop(); // kick it off
     }
-
-    setup().catch((err) => {
-      console.error("Pose setup failed", err);
-      setError("Could not start pose detection.");
-    });
+    start();
 
     return () => {
       cancelled = true;
-      cancelAnimationFrame(animationId);
-      poseLandmarker?.close();
+      clearInterval(pollId);
+      tracker?.destroy();
+      tracker = null;
+      trackerRef.current = null;
     };
   }, []);
+
+  // Load any saved calibration on mount (localStorage is client-only).
+  useEffect(() => {
+    setCal(loadCalibration());
+  }, []);
+
+  // Sample the live hip height for ~1.5s, average it, and build the calibration.
+  async function captureStance() {
+    const tracker = trackerRef.current;
+    if (!tracker || capturing) return;
+    setCapturing(true);
+
+    const samples: number[] = [];
+    const start = performance.now();
+    await new Promise<void>((resolve) => {
+      const id = window.setInterval(() => {
+        const h = tracker.getSignals().hipHeight;
+        if (h !== null) samples.push(h);
+        if (performance.now() - start >= 1500) {
+          clearInterval(id);
+          resolve();
+        }
+      }, 50);
+    });
+
+    setCapturing(false);
+    if (samples.length === 0) return; // no pose detected during the window
+    const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
+    const c = makeCalibration(avg);
+    setCal(c);
+    saveCalibration(c);
+  }
+
+  const stance = classifyStance(debugHip, cal);
+
+  function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else {
+      document.documentElement.requestFullscreen().catch(() => {});
+    }
+  }
 
   // --- Dev debug overlay toggle: press "D" to show/hide ---
   useEffect(() => {
@@ -128,16 +133,11 @@ export default function Home() {
 
   // --- Camera: request the webcam and stream it into the <video> ---
   useEffect(() => {
-    // Keep track of stream instance for component cleanup
     let localStream: MediaStream | null = null;
 
     async function startCamera() {
       try {
-        localStream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: false,
-        });
-
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
         if (videoRef.current) {
           videoRef.current.srcObject = localStream;
         }
@@ -157,50 +157,144 @@ export default function Home() {
   }, []);
 
   return (
-    <div style={{ position: "relative", width: "100%", maxWidth: "640px" }}>
+    <div style={{ position: "fixed", inset: 0, overflow: "hidden", background: "#000" }}>
       <video
         ref={videoRef}
         autoPlay
         playsInline
         muted
         style={{
+          position: "absolute",
+          inset: 0,
           width: "100%",
-          display: "block",
-          borderRadius: "8px",
-          transform: "scaleX(-1)", // mirror so it reads like a mirror
+          height: "100%",
+          objectFit: "cover",
+          transform: "scaleX(-1)",
         }}
       />
       <canvas
         ref={canvasRef}
         style={{
           position: "absolute",
-          top: 0, // pin to the same corner as the video
-          left: 0,
+          inset: 0,
           width: "100%",
           height: "100%",
-          transform: "scaleX(-1)", // mirror the canvas the SAME way as the video
+          objectFit: "cover",
+          transform: "scaleX(-1)",
+          pointerEvents: "none", // passive overlay — never intercept clicks
         }}
       />
+
       {showDebug && (
         <div
           style={{
             position: "absolute",
-            top: 8,
-            left: 8,
-            padding: "6px 10px",
+            top: 16,
+            left: 16,
+            padding: "10px 14px",
             background: "rgba(0, 0, 0, 0.6)",
             color: "#0f0",
-            font: "13px monospace",
-            borderRadius: "6px",
-            pointerEvents: "none", // never intercept clicks
+            font: "16px monospace",
+            borderRadius: "8px",
+            pointerEvents: "none",
           }}
         >
           hipY: {debugHip === null ? "— (no pose)" : debugHip.toFixed(3)}
           <br />
-          <span style={{ color: "#888" }}>press D to hide</span>
+          <span style={{ color: "#aaa" }}>press D to hide</span>
         </div>
       )}
-      {error && <p style={{ color: "crimson" }}>{error}</p>}
+
+      {/* Live stance indicator (driven by calibration) */}
+      {cal && (
+        <div
+          style={{
+            position: "absolute",
+            top: 16,
+            right: 16,
+            padding: "10px 18px",
+            borderRadius: "8px",
+            font: "700 20px system-ui, sans-serif",
+            background: STANCE_UI[stance].bg,
+            color: "#fff",
+            pointerEvents: "none",
+          }}
+        >
+          {STANCE_UI[stance].label}
+        </div>
+      )}
+
+      <button
+        onClick={toggleFullscreen}
+        style={{
+          position: "absolute",
+          top: cal ? 64 : 16,
+          right: 16,
+          padding: "10px 16px",
+          fontSize: 15,
+          borderRadius: 8,
+          border: "none",
+          background: "rgba(0,0,0,0.6)",
+          color: "#fff",
+          cursor: "pointer",
+        }}
+      >
+        ⛶ Fullscreen
+      </button>
+
+      {error && (
+        <p
+          style={{
+            position: "absolute",
+            top: 72,
+            left: 16,
+            color: "#fff",
+            background: "crimson",
+            padding: "8px 12px",
+            borderRadius: 6,
+            font: "15px system-ui, sans-serif",
+          }}
+        >
+          {error}
+        </p>
+      )}
+
+      {/* Calibration panel — large, floating over the camera at the bottom */}
+      <div
+        style={{
+          position: "absolute",
+          left: "50%",
+          bottom: 28,
+          transform: "translateX(-50%)",
+          width: "min(92vw, 580px)",
+          padding: 24,
+          borderRadius: 14,
+          background: "rgba(0,0,0,0.72)",
+          color: "#fff",
+          font: "16px system-ui, sans-serif",
+          textAlign: "center",
+          boxShadow: "0 8px 30px rgba(0,0,0,0.5)",
+        }}
+      >
+        <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 8 }}>Stance calibration</div>
+        <div style={{ fontSize: 15, opacity: 0.85, marginBottom: 16 }}>
+          Get into your athletic dribbling stance — knees bent, hips low — and hold while capturing.
+          This becomes your <strong>READY</strong> baseline.
+        </div>
+        <button onClick={captureStance} disabled={capturing} style={calBtnStyle}>
+          {capturing ? "Hold your stance…" : cal ? "Re-capture stance" : "Capture dribble stance"}
+        </button>
+        <div style={{ marginTop: 18, font: "15px monospace", opacity: 0.9 }}>
+          {cal === null ? (
+            "not calibrated yet"
+          ) : (
+            <>
+              ready: {cal.ready.toFixed(3)} · tall&lt;{cal.tallThreshold.toFixed(3)} · duck≥
+              {cal.duckThreshold.toFixed(3)}
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
